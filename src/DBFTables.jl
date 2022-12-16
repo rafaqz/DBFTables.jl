@@ -2,6 +2,8 @@ module DBFTables
 
 import Printf, Tables, WeakRefStrings
 
+using Datess
+
 "Field/column descriptor, part of the Header"
 struct FieldDescriptor
     name::Symbol
@@ -38,14 +40,59 @@ struct Row <: Tables.AbstractRow
     row::Int
 end
 
+#=
+From https://www.dbase.com/Knowledgebase/INT/db7_file_fmt.htm
+
+Symbol 	Data Type 	        Description
+B 	    Binary, a string 	10 digits representing a .DBT block number. The number is stored as a string, right justified and padded with blanks.
+C 	    Character 	        All OEM code page characters - padded with blanks to the width of the field.
+D 	    Date 	            8 bytes - date stored as a string in the format YYYYMMDD.
+N 	    Numeric 	        Number stored as a string, right justified, and padded with blanks to the width of the field. 
+L 	    Logical 	        1 byte - initialized to 0x20 (space) otherwise T or F.
+M 	    Memo, a string 	    10 digits (bytes) representing a .DBT block number. The number is stored as a string, right justified and padded with blanks.
+@ 	    Timestamp 	        8 bytes - two longs, first for date, second for time.  The date is the number of days since  01/01/4713 BC. Time is hours * 3600000L + minutes * 60000L + Seconds * 1000L
+I 	    Long 	            4 bytes. Leftmost bit used to indicate sign, 0 negative.
++ 	    Autoincrement 	    Same as a Long
+F 	    Float 	            Number stored as a string, right justified, and padded with blanks to the width of the field. 
+O 	    Double 	            8 bytes - no conversions, stored as a double.
+G 	    OLE 	            10 digits (bytes) representing a .DBT block number. The number is stored as a string, right justified and padded with blanks.
+=#
+
+"Convert Julia types to DBF data type characters"
+function jl2dbf_type(T)
+    T1 = nonmissingtype(T)
+    ndec = 0
+    if T1 <: AbstractString 
+        fld = 'C'
+    elseif T1 <: DateTime
+        fld = 'D'
+    # TODO: allow string numbers and e.g. FixedPointNumbers.jl types here?
+    # elseif T <: FixedPointNumber ??
+        # fld == 'N'
+        # ndec = 10 # ???
+    # elseif T <: Integer
+    #     fld == 'N'
+    #     ndec = 0
+    elseif T1 <: AbstractFloat
+        fld = 'O' # fld == 'F' TODO allow the string version `F` ?
+    elseif T1 <: Bool
+        fld = 'L'
+    elseif T1 <: Integer
+        fld = 'I'
+    else
+        throw(ArgumentError("Cannot write columns of type T to dbf"))
+    end
+    return (; type=fld, ndec=ndec)
+end
+
 "Convert DBF data type characters to Julia types"
-function typemap(fld::Char, ndec::UInt8)
+function dfb2jl_type(fld::Char, ndec::UInt8)
     # https://www.clicketyclick.dk/databases/xbase/format/data_types.html
     rt = Nothing
     if fld == 'C'
         rt = String
     elseif fld == 'D'
-        rt = String
+        rt = DateTime
     elseif fld == 'N'
         if ndec > 0
             rt = Float64
@@ -65,7 +112,7 @@ function typemap(fld::Char, ndec::UInt8)
 end
 
 "Read a field descriptor from the stream, and create a FieldDescriptor struct"
-function read_dbf_field(io::IO)
+function Base.read(io::IO, Type{FieldDescriptor})
     field_name_raw = String(read!(io, Vector{UInt8}(undef, 11)))
     field_name = Symbol(strip(replace(field_name_raw, '\0' => ' ')))
     field_type = read(io, Char)
@@ -73,12 +120,32 @@ function read_dbf_field(io::IO)
     field_len = read(io, UInt8)
     field_dec = read(io, UInt8)
     skip(io, 14)  # reserved
-    jltype = typemap(field_type, field_dec)
+    jltype = dbf2jl_type(field_type, field_dec)
     return FieldDescriptor(field_name, jltype, field_len, field_dec)
 end
 
+function Base.write(io::IO, fd::FieldDescriptor)
+    field_name_raw = String(read!(io, Vector{UInt8}(undef, 11)))
+    field_name_raw = replace(ascii(fd.field_name), ' ' => '\0') 
+    if length(field_name_raw) > 11
+        field_name_chars[1:11]
+    else
+        lpad(field_name_raw, 11, "\0")
+    end
+
+    bytes = write(io, field_name_raw)
+    bytes += write(io, fd.field_type)
+    bytes += write(io, zeros(UInt8, 4)) # skip
+    bytes += write(io, fd.field_len)
+    bytes += write(io, fd.field_dec)
+    bytes += write(io, zeros(UInt8, 14))  # reserved
+
+    return bytes
+end
+
 "Read a DBF header from a stream"
-function Header(io::IO)
+Header(io::IO) = read(io, Header)
+function Base.read(io::IO, Header)
     ver = read(io, UInt8)
     date1 = read(io, UInt8)
     date2 = read(io, UInt8)
@@ -87,20 +154,20 @@ function Header(io::IO)
     records = read(io, UInt32)
     hsize = read(io, UInt16)
     rsize = read(io, UInt16)
-    skip(io, 2)  # reserved
+    skip(io, 2) # reserved
     incomplete = Bool(read(io, UInt8))
     encrypted = Bool(read(io, UInt8))
-    skip(io, 12)  # reserved
+    skip(io, 12) # reserved
     mdx = Bool(read(io, UInt8))
     lang_id = read(io, UInt8)
-    skip(io, 2)  # reserved
+    skip(io, 2) # reserved
     fields = FieldDescriptor[]
 
     # use Dict for quicker column index lookup
     fieldcolumns = Dict{Symbol,Int}()
     col = 1
     while !eof(io)
-        field = read_dbf_field(io)
+        field = read(io, FieldDescriptor)
         fieldcolumns[field.name] = col
         push!(fields, field)
         col += 1
@@ -130,10 +197,47 @@ function Header(io::IO)
     )
 end
 
+"Write a DBF header to a stream"
+function Base.write(io::IO, h::Header)
+    bytes += write(io, h.ver)
+    date1 = UInt8(parse(Int, h.last_update[1:4]) - 1900)
+    date2 = parse(UInt8, h.last_update[4:6])
+    date3 = parse(UInt8, h.last_update[7:8])
+    bytes += write(io, date1)
+    bytes += write(io, date2)
+    bytes += write(io, date3)
+    bytes += write(io, h.records)
+    bytes += write(io, h.hsize)
+    bytes += write(io, h.rsize)
+    bytes += write(io, zeros(UInt8, 2)) # reserved
+    bytes += write(io, UInt8(h.incomplete))
+    bytes += write(io, UInt8(h.encrypted))
+    bytes += write(io, zeros(UInt8, 12)) # reserved
+    bytes += write(io, UInt8(mdx))
+    bytes += write(io, lang_id)
+    bytes += write(io, zeros(UInt8, 2)) # reserved
+
+    for field in h.fields
+        bytes += write(io, field)
+    end
+    # End byte for fields list
+    bytes += write(io, 0xD)
+
+    return bytes
+end
+
 miss(x) = ifelse(x === nothing, missing, x)
 
-"Concert a DBF entry string to a Julia value"
-function dbf_value(::Type{Bool}, str::AbstractString)
+
+"Convert a DBF entry string to a Julia value"
+function dbf2jl_value end
+
+"Convert a Julia value to DBF entry"
+function jl2dbf_value end
+
+jl2dbf_value(val::Bool) = val ? "T" : "F"
+
+function dbf2jl_value(::Type{Bool}, str::AbstractString)
     char = first(str)
     if char in "YyTt"
         true
@@ -146,18 +250,33 @@ function dbf_value(::Type{Bool}, str::AbstractString)
     end
 end
 
-dbf_value(T::Union{Type{Int},Type{Float64}}, str::AbstractString) = miss(tryparse(T, str))
-# String to avoid returning SubString{String}
-function dbf_value(::Type{String}, str::AbstractString)
+dbf2jl_value(T::Union{Type{Int},Type{Float64}}, str::AbstractString) = miss(tryparse(T, str))
+
+jl2dbf_value(::Type{Float64}, val::AbstractFloat) = Float64(val)
+jl2dbf_value(::Type{Int}, val::Integer) = Int64(val)
+jl2dbf_value(::Type{Int}, val::Missing) = Int64(val)
+
+function dbf2jl_value(::Type{DateTime}, str::AbstractString)
     stripped = rstrip(str)
     if isempty(stripped)
         # return missing rather than ""
         return missing
     else
+        return DateTime(stripped)
+    end
+end
+function dbf2jl_value(::Type{String}, str::AbstractString)
+    stripped = rstrip(str)
+    if isempty(stripped)
+        # return missing rather than ""
+        return missing
+    else
+        # String to avoid returning SubString{String}
         return String(stripped)
     end
 end
-dbf_value(::Type{Nothing}, ::AbstractString) = missing
+dbf2jl_value(::Type{Nothing}, ::AbstractString) = missing
+jl2dbf_value(::Type{Nothing}, ::AbstractString) = missing
 
 # define get functions using getfield since we overload getproperty
 "Access the header of a DBF Table"
